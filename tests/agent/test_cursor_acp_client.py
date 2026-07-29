@@ -9,9 +9,10 @@ from agent.cursor_acp_client import CursorACPClient
 
 
 class CursorACPPersistentSessionTests(unittest.TestCase):
-    def test_second_prompt_reuses_existing_session(self) -> None:
+    def test_second_prompt_reuses_process_but_new_acp_session(self) -> None:
         client = CursorACPClient(acp_cwd="/tmp")
         rpc_calls: list[str] = []
+        fake_proc = MagicMock(poll=MagicMock(return_value=None), stdin=MagicMock())
 
         def fake_jsonrpc(
             _proc,
@@ -35,12 +36,18 @@ class CursorACPPersistentSessionTests(unittest.TestCase):
 
         with patch.object(client, "_jsonrpc_request", side_effect=fake_jsonrpc):
             with patch.object(
+                client, "_spawn_persistent_process", return_value=fake_proc
+            ), patch.object(
                 client,
-                "_spawn_persistent_process",
-                return_value=MagicMock(poll=MagicMock(return_value=None), stdin=MagicMock()),
+                "_ensure_persistent_process",
+                wraps=client._ensure_persistent_process,
             ):
-                first = client._run_prompt("one", model_hint="composer-2.5", timeout_seconds=30)
-                second = client._run_prompt("two", model_hint="composer-2.5", timeout_seconds=30)
+                first = client._run_prompt(
+                    "one", model_hint="composer-2.5", timeout_seconds=30
+                )
+                second = client._run_prompt(
+                    "two", model_hint="composer-2.5", timeout_seconds=30
+                )
 
         self.assertEqual(first, ("ok", ""))
         self.assertEqual(second, ("ok", ""))
@@ -50,6 +57,7 @@ class CursorACPPersistentSessionTests(unittest.TestCase):
                 "initialize",
                 "session/new",
                 "session/prompt",
+                "session/new",
                 "session/prompt",
             ],
         )

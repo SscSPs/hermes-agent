@@ -132,10 +132,15 @@ def _format_messages_as_prompt(
     tool_choice: Any = None,
 ) -> str:
     sections: list[str] = [
-        "You are being used as the active ACP agent backend for Hermes.",
-        "Use ACP capabilities to complete tasks.",
-        "IMPORTANT: If you take an action with a tool, you MUST output tool calls using <tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape.",
-        "If no tool is needed, answer normally.",
+        "You are the language-model backend for Hermes. You are NOT the executing agent.",
+        "This ACP session cannot run shell, terminal, or filesystem actions — permission "
+        "requests are always cancelled.",
+        "Never use ACP-native tools or ask to run commands yourself.",
+        "When you need to act, emit Hermes tool calls ONLY as "
+        "<tool_call>{...}</tool_call> blocks with JSON in OpenAI function-call shape "
+        "(id, type, function.name, function.arguments as a JSON string).",
+        "Hermes executes those tools (terminal, read_file, web_search, etc.) and returns results.",
+        "If no tool is needed, answer in plain text.",
     ]
     if model:
         sections.append(f"Hermes requested model hint: {model}")
@@ -409,6 +414,7 @@ class CursorACPClient:
         self._session_id: str | None = None
         self._session_cmd_key: tuple[str, ...] | None = None
         self._session_cwd: str | None = None
+        self._process_initialized = False
         self._rpc_id = 0
         self._inbox: queue.Queue[dict[str, Any]] = queue.Queue()
         self._stderr_tail: deque[str] = deque(maxlen=40)
@@ -429,6 +435,7 @@ class CursorACPClient:
         self._session_id = None
         self._session_cmd_key = None
         self._session_cwd = None
+        self._process_initialized = False
         self._reader_threads = []
         while True:
             try:
@@ -563,9 +570,9 @@ class CursorACPClient:
             raise RuntimeError(f"Cursor ACP process exited early: {stderr_text}")
         raise TimeoutError(f"Timed out waiting for Cursor ACP response to {method}.")
 
-    def _ensure_persistent_session(
+    def _ensure_persistent_process(
         self, *, model_hint: str | None, timeout_seconds: float
-    ) -> tuple[subprocess.Popen[str], str]:
+    ) -> subprocess.Popen[str]:
         cmd = self._build_acp_command(model_hint)
         cmd_key = tuple(cmd)
         cwd = self._acp_cwd
@@ -573,11 +580,11 @@ class CursorACPClient:
         if (
             proc is not None
             and proc.poll() is None
-            and self._session_id
+            and self._process_initialized
             and self._session_cmd_key == cmd_key
             and self._session_cwd == cwd
         ):
-            return proc, self._session_id
+            return proc
 
         self._teardown_persistent_locked()
         proc = self._spawn_persistent_process(cmd)
@@ -592,12 +599,7 @@ class CursorACPClient:
             "initialize",
             {
                 "protocolVersion": 1,
-                "clientCapabilities": {
-                    "fs": {
-                        "readTextFile": True,
-                        "writeTextFile": True,
-                    }
-                },
+                "clientCapabilities": {},
                 "clientInfo": {
                     "name": "hermes-agent",
                     "title": "Hermes Agent",
@@ -606,12 +608,18 @@ class CursorACPClient:
             },
             timeout_seconds=timeout_seconds,
         )
+        self._process_initialized = True
+        return proc
+
+    def _new_acp_session(
+        self, proc: subprocess.Popen[str], *, timeout_seconds: float
+    ) -> str:
         session = (
             self._jsonrpc_request(
                 proc,
                 "session/new",
                 {
-                    "cwd": cwd,
+                    "cwd": self._acp_cwd,
                     "mcpServers": [],
                 },
                 timeout_seconds=timeout_seconds,
@@ -620,10 +628,9 @@ class CursorACPClient:
         )
         session_id = str(session.get("sessionId") or "").strip()
         if not session_id:
-            self._teardown_persistent_locked()
             raise RuntimeError("Cursor ACP did not return a sessionId.")
         self._session_id = session_id
-        return proc, session_id
+        return session_id
 
     def _create_chat_completion(
         self,
@@ -694,9 +701,12 @@ class CursorACPClient:
         for attempt in range(2):
             try:
                 with self._active_process_lock:
-                    proc, session_id = self._ensure_persistent_session(
+                    proc = self._ensure_persistent_process(
                         model_hint=model_hint,
                         timeout_seconds=timeout_seconds,
+                    )
+                    session_id = self._new_acp_session(
+                        proc, timeout_seconds=timeout_seconds
                     )
                     text_parts: list[str] = []
                     reasoning_parts: list[str] = []
