@@ -724,6 +724,21 @@ class TestRuntimeProviderResolution:
         assert result["command"] == "/usr/local/bin/copilot"
         assert result["args"] == ["--acp", "--stdio", "--debug"]
 
+    def test_runtime_cursor_acp_uses_process_runtime(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: f"/usr/local/bin/{command}")
+        monkeypatch.setenv("HERMES_CURSOR_ACP_ARGS", "agent acp")
+
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        result = resolve_runtime_provider(requested="cursor-acp")
+
+        assert result["provider"] == "cursor-acp"
+        assert result["api_mode"] == "chat_completions"
+        assert result["api_key"] == "cursor-acp"
+        assert result["base_url"] == "acp://cursor"
+        assert result["command"] == "/usr/local/bin/cursor"
+        assert result["args"] == ["agent", "acp"]
+
 
 # =============================================================================
 # _has_any_provider_configured tests
