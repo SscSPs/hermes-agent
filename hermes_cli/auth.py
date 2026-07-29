@@ -232,6 +232,12 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
     ),
+    "cursor-acp": ProviderConfig(
+        id="cursor-acp",
+        name="Cursor ACP",
+        auth_type="external_process",
+        inference_base_url="acp://cursor",
+    ),
     "gemini": ProviderConfig(
         id="gemini",
         name="Google AI Studio",
@@ -6787,18 +6793,23 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
+    from hermes_cli.external_process_acp import (
+        get_external_process_acp_cli_spec,
+        resolve_external_process_command_and_args,
+        resolve_external_process_command_path,
     )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+
+    try:
+        get_external_process_acp_cli_spec(provider_id)
+    except KeyError:
+        return {"configured": False}
+
+    command, args = resolve_external_process_command_and_args(provider_id)
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
         base_url = pconfig.inference_base_url
 
-    resolved_command = shutil.which(command) if command else None
+    resolved_command = resolve_external_process_command_path(provider_id)
     return {
         "configured": bool(resolved_command or base_url.startswith("acp+tcp://")),
         "provider": provider_id,
@@ -6829,6 +6840,8 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
     if target == "minimax-oauth":
         return get_minimax_oauth_auth_status()
     if target == "copilot-acp":
+        return get_external_process_provider_status(target)
+    if target == "cursor-acp":
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
@@ -7011,25 +7024,33 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     if not base_url:
         base_url = pconfig.inference_base_url
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
+    from hermes_cli.external_process_acp import (
+        get_external_process_acp_cli_spec,
+        resolve_external_process_command_and_args,
+        resolve_external_process_command_path,
     )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-    resolved_command = shutil.which(command) if command else None
+
+    try:
+        spec = get_external_process_acp_cli_spec(provider_id)
+    except KeyError:
+        raise AuthError(
+            f"Provider '{provider_id}' is not a known external-process ACP provider.",
+            provider=provider_id,
+            code="invalid_provider",
+        ) from None
+
+    command, args = resolve_external_process_command_and_args(provider_id)
+    resolved_command = resolve_external_process_command_path(provider_id)
     if not resolved_command and not base_url.startswith("acp+tcp://"):
         raise AuthError(
-            f"Could not find the Copilot CLI command '{command}'. "
-            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
+            f"Could not find the CLI command '{command}'. {spec.missing_cli_install_hint}",
             provider=provider_id,
-            code="missing_copilot_cli",
+            code=spec.missing_cli_code,
         )
 
     return {
         "provider": provider_id,
-        "api_key": "copilot-acp",
+        "api_key": spec.placeholder_api_key,
         "base_url": base_url.rstrip("/"),
         "command": resolved_command or command,
         "args": args,

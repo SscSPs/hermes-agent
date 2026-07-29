@@ -215,6 +215,13 @@ class TestProviderModelIds:
              patch("hermes_cli.models._fetch_github_models", return_value=["gpt-5.4", "claude-sonnet-4.6"]):
             assert provider_model_ids("copilot-acp") == ["gpt-5.4", "claude-sonnet-4.6"]
 
+    def test_cursor_acp_prefers_live_cli_catalog(self):
+        with patch(
+            "hermes_cli.models.fetch_cursor_agent_model_ids",
+            return_value=["composer-2.5", "auto"],
+        ):
+            assert provider_model_ids("cursor-acp") == ["composer-2.5", "auto"]
+
     def test_anthropic_provider_uses_configured_base_url_for_live_catalog(self):
         class _Resp:
             def __enter__(self):

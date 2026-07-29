@@ -466,6 +466,16 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
             # if the Copilot-specific path is unavailable for any reason.
             pass
 
+    if provider in {"cursor-acp"}:
+        try:
+            from hermes_cli.cursor_cli_catalog import normalize_cursor_model_id
+
+            normalized = normalize_cursor_model_id(name)
+            if normalized:
+                return normalized
+        except Exception:
+            pass
+
     # --- Copilot / Copilot ACP / openai-codex fallback:
     #     strip matching provider prefix, keep dots ---
     if provider in _STRIP_VENDOR_ONLY_PROVIDERS:

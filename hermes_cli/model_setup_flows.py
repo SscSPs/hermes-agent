@@ -1838,52 +1838,13 @@ def _model_flow_copilot(config, current_model=""):
     else:
         print("No change.")
 
-def _model_flow_copilot_acp(config, current_model=""):
-    """GitHub Copilot ACP flow using the local Copilot CLI."""
-    from hermes_cli.auth import (
-        PROVIDER_REGISTRY,
-        _prompt_model_selection,
-        _save_model_choice,
-        deactivate_provider,
-        get_external_process_provider_status,
-        resolve_api_key_provider_credentials,
-        resolve_external_process_provider_credentials,
-    )
+def _copilot_acp_picker_state(current_model: str) -> dict:
+    from hermes_cli.auth import resolve_api_key_provider_credentials
     from hermes_cli.models import (
         _PROVIDER_MODELS,
         fetch_github_model_catalog,
         normalize_copilot_model_id,
     )
-    from hermes_cli.config import load_config, save_config
-
-    del config
-
-    provider_id = "copilot-acp"
-    pconfig = PROVIDER_REGISTRY[provider_id]
-
-    status = get_external_process_provider_status(provider_id)
-    resolved_command = (
-        status.get("resolved_command") or status.get("command") or "copilot"
-    )
-    effective_base = status.get("base_url") or pconfig.inference_base_url
-
-    print("  GitHub Copilot ACP delegates Hermes turns to `copilot --acp`.")
-    print("  Hermes currently starts its own ACP subprocess for each request.")
-    print("  Hermes uses your selected model as a hint for the Copilot ACP session.")
-    print(f"  Command: {resolved_command}")
-    print(f"  Backend marker: {effective_base}")
-    print()
-
-    try:
-        creds = resolve_external_process_provider_credentials(provider_id)
-    except Exception as exc:
-        print(f"  ⚠ {exc}")
-        print(
-            "  Set HERMES_COPILOT_ACP_COMMAND or COPILOT_CLI_PATH if Copilot CLI is installed elsewhere."
-        )
-        return
-
-    effective_base = creds.get("base_url") or effective_base
 
     catalog_api_key = ""
     try:
@@ -1893,7 +1854,7 @@ def _model_flow_copilot_acp(config, current_model=""):
         pass
 
     catalog = fetch_github_model_catalog(catalog_api_key)
-    normalized_current_model = (
+    normalized_current = (
         normalize_copilot_model_id(
             current_model,
             catalog=catalog,
@@ -1913,13 +1874,120 @@ def _model_flow_copilot_acp(config, current_model=""):
             )
             print('    Use "Enter custom model name" if you do not see your model.')
 
+    def normalize_selected(selected: str) -> str:
+        return (
+            normalize_copilot_model_id(
+                selected,
+                catalog=catalog,
+                api_key=catalog_api_key,
+            )
+            or selected
+        )
+
+    return {
+        "model_list": model_list,
+        "normalized_current": normalized_current,
+        "confirm_api_key": catalog_api_key,
+        "normalize_selected": normalize_selected,
+    }
+
+
+def _cursor_acp_picker_state(current_model: str) -> dict:
+    from hermes_cli.cursor_cli_catalog import (
+        fetch_cursor_agent_model_ids,
+        normalize_cursor_model_id,
+    )
+    from hermes_cli.models import _PROVIDER_MODELS
+
+    live_models = fetch_cursor_agent_model_ids()
+    normalized_current = (
+        normalize_cursor_model_id(current_model, known_ids=live_models)
+        or current_model
+    )
+
+    if live_models:
+        model_list = live_models
+        print(f"  Found {len(model_list)} model(s) from Cursor CLI")
+    else:
+        model_list = _PROVIDER_MODELS.get("cursor-acp", [])
+        if model_list:
+            print(
+                "  ⚠ Could not auto-detect models from Cursor CLI — showing defaults."
+            )
+            print('    Use "Enter custom model name" if you do not see your model.')
+
+    def normalize_selected(selected: str) -> str:
+        return (
+            normalize_cursor_model_id(selected, known_ids=live_models or model_list)
+            or selected
+        )
+
+    return {
+        "model_list": model_list,
+        "normalized_current": normalized_current,
+        "confirm_api_key": "",
+        "normalize_selected": normalize_selected,
+    }
+
+
+def _model_flow_external_process_acp(
+    config,
+    current_model: str = "",
+    *,
+    provider_id: str,
+    intro_lines: tuple[str, ...],
+    cli_env_hint: str,
+    default_command_fallback: str,
+    build_picker_state,
+):
+    """Shared ``hermes model`` flow for local ACP subprocess providers."""
+    from hermes_cli.auth import (
+        PROVIDER_REGISTRY,
+        _prompt_model_selection,
+        _save_model_choice,
+        deactivate_provider,
+        get_external_process_provider_status,
+        resolve_external_process_provider_credentials,
+    )
+    from hermes_cli.config import load_config, save_config
+
+    del config
+
+    pconfig = PROVIDER_REGISTRY[provider_id]
+    status = get_external_process_provider_status(provider_id)
+    resolved_command = (
+        status.get("resolved_command")
+        or status.get("command")
+        or default_command_fallback
+    )
+    effective_base = status.get("base_url") or pconfig.inference_base_url
+
+    for line in intro_lines:
+        print(line)
+    print(f"  Command: {resolved_command}")
+    print(f"  Backend marker: {effective_base}")
+    print()
+
+    try:
+        creds = resolve_external_process_provider_credentials(provider_id)
+    except Exception as exc:
+        print(f"  ⚠ {exc}")
+        print(f"  {cli_env_hint}")
+        return
+
+    effective_base = creds.get("base_url") or effective_base
+    picker = build_picker_state(current_model)
+    model_list = picker.get("model_list") or []
+    normalized_current_model = picker.get("normalized_current", current_model)
+    confirm_api_key = picker.get("confirm_api_key", "")
+
     if model_list:
         selected = _prompt_model_selection(
             model_list,
             current_model=normalized_current_model,
             confirm_provider=provider_id,
             confirm_base_url=effective_base,
-            confirm_api_key=catalog_api_key,
+            confirm_api_key=confirm_api_key,
         )
     else:
         try:
@@ -1931,14 +1999,10 @@ def _model_flow_copilot_acp(config, current_model=""):
         print("No change.")
         return
 
-    selected = (
-        normalize_copilot_model_id(
-            selected,
-            catalog=catalog,
-            api_key=catalog_api_key,
-        )
-        or selected
-    )
+    normalize_selected = picker.get("normalize_selected")
+    if callable(normalize_selected):
+        selected = normalize_selected(selected) or selected
+
     _save_model_choice(selected)
 
     cfg = load_config()
@@ -1954,6 +2018,47 @@ def _model_flow_copilot_acp(config, current_model=""):
     deactivate_provider()
 
     print(f"Default model set to: {selected} (via {pconfig.name})")
+
+
+def _model_flow_copilot_acp(config, current_model=""):
+    """GitHub Copilot ACP flow using the local Copilot CLI."""
+    _model_flow_external_process_acp(
+        config,
+        current_model,
+        provider_id="copilot-acp",
+        intro_lines=(
+            "  GitHub Copilot ACP delegates Hermes turns to `copilot --acp`.",
+            "  Hermes currently starts its own ACP subprocess for each request.",
+            "  Hermes uses your selected model as a hint for the Copilot ACP session.",
+        ),
+        cli_env_hint=(
+            "  Set HERMES_COPILOT_ACP_COMMAND or COPILOT_CLI_PATH "
+            "if Copilot CLI is installed elsewhere."
+        ),
+        default_command_fallback="copilot",
+        build_picker_state=_copilot_acp_picker_state,
+    )
+
+
+def _model_flow_cursor_acp(config, current_model=""):
+    """Cursor ACP flow using the local Cursor CLI."""
+    _model_flow_external_process_acp(
+        config,
+        current_model,
+        provider_id="cursor-acp",
+        intro_lines=(
+            "  Cursor ACP delegates Hermes turns to `cursor agent acp`.",
+            "  Hermes currently starts its own ACP subprocess for each request.",
+            "  Hermes uses your selected model as a hint for the Cursor ACP session.",
+        ),
+        cli_env_hint=(
+            "  Set HERMES_CURSOR_ACP_COMMAND or CURSOR_CLI_PATH "
+            "if Cursor CLI is installed elsewhere."
+        ),
+        default_command_fallback="cursor",
+        build_picker_state=_cursor_acp_picker_state,
+    )
+
 
 def _model_flow_kimi(config, current_model=""):
     """Kimi / Moonshot model selection with automatic endpoint routing.

@@ -19,6 +19,11 @@ from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
 from hermes_cli import __version__ as _HERMES_VERSION
+from hermes_cli.cursor_cli_catalog import fetch_cursor_agent_model_ids, normalize_cursor_model_id
+from hermes_cli.external_process_acp import (
+    EXTERNAL_PROCESS_ACP_PROVIDER_IDS,
+    external_process_cache_fingerprint_parts,
+)
 from hermes_cli.urllib_security import open_credentialed_url
 
 # Identify ourselves so endpoints fronted by Cloudflare's Browser Integrity
@@ -267,6 +272,13 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "xai-oauth": _xai_curated_models(),
     "copilot-acp": [
         "copilot-acp",
+    ],
+    "cursor-acp": [
+        "composer-2.5",
+        "auto",
+        "default",
+        "gpt-5.2",
+        "claude-sonnet-4.6",
     ],
     "copilot": [
         "gpt-5.4",
@@ -1091,6 +1103,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("nvidia",         "NVIDIA NIM",               "NVIDIA NIM (Nemotron models via build.nvidia.com or local NIM)"),
     ProviderEntry("copilot",        "GitHub Copilot",           "GitHub Copilot (Uses GITHUB_TOKEN or gh auth token)"),
     ProviderEntry("copilot-acp",    "GitHub Copilot ACP",       "GitHub Copilot ACP (Spawns copilot --acp --stdio)"),
+    ProviderEntry("cursor-acp",     "Cursor ACP",              "Cursor ACP (Spawns cursor agent acp for Composer 2.5 and other Cursor models)"),
     ProviderEntry("huggingface",    "Hugging Face",             "Hugging Face Inference Providers"),
     ProviderEntry("gemini",         "Google AI Studio",         "Google AI Studio (Native Gemini API)"),
     ProviderEntry("vertex",         "Google Vertex AI",         "Google Vertex AI (Gemini via GCP; OAuth2 service account or ADC, GCP billing/quotas)"),
@@ -1169,6 +1182,7 @@ PROVIDER_GROUPS: dict[str, tuple[str, str, list[str]]] = {
     "qwen":     ("Qwen",            "Qwen Cloud / DashScope, Coding Plan & Qwen CLI OAuth", ["alibaba", "alibaba-coding-plan", "qwen-oauth"]),
     "opencode": ("OpenCode",        "Zen pay-as-you-go or Go subscription",            ["opencode-zen", "opencode-go"]),
     "copilot":  ("GitHub Copilot",  "GitHub token API or copilot --acp process",       ["copilot", "copilot-acp"]),
+    "cursor":   ("Cursor",          "Cursor CLI ACP (Composer 2.5 and other models)",  ["cursor-acp"]),
 }
 
 # Reverse index: member slug -> group_id. Built once at import.
@@ -1253,6 +1267,8 @@ _PROVIDER_ALIASES = {
     "github-model": "copilot",
     "github-copilot-acp": "copilot-acp",
     "copilot-acp-agent": "copilot-acp",
+    "cursor-acp-agent": "cursor-acp",
+    "cursor-acp": "cursor-acp",
     "google": "gemini",
     "google-gemini": "gemini",
     "google-ai-studio": "gemini",
@@ -2621,6 +2637,14 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         return get_codex_model_ids(access_token=access_token)
     if normalized == "xai-oauth":
         return list(_PROVIDER_MODELS.get("xai-oauth", _PROVIDER_MODELS.get("xai", [])))
+    if normalized == "cursor-acp":
+        try:
+            live = fetch_cursor_agent_model_ids()
+            if live:
+                return live
+        except Exception:
+            pass
+        return list(_PROVIDER_MODELS.get("cursor-acp", []))
     if normalized in {"copilot", "copilot-acp"}:
         try:
             live = _fetch_github_models(_resolve_copilot_catalog_api_key())
@@ -2911,6 +2935,9 @@ def _credential_fingerprint(provider: str) -> str:
                 pass
     except Exception:
         pass
+
+    if provider in EXTERNAL_PROCESS_ACP_PROVIDER_IDS:
+        parts.extend(external_process_cache_fingerprint_parts(provider))
 
     # External well-known credential file locations
     for path in (
