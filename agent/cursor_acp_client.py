@@ -406,13 +406,35 @@ class CursorACPClient:
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
         self._active_process_lock = threading.Lock()
+        self._session_id: str | None = None
+        self._session_cmd_key: tuple[str, ...] | None = None
+        self._session_cwd: str | None = None
+        self._rpc_id = 0
+        self._inbox: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._stderr_tail: deque[str] = deque(maxlen=40)
+        self._reader_threads: list[threading.Thread] = []
 
-    def close(self) -> None:
-        proc: subprocess.Popen[str] | None
-        with self._active_process_lock:
-            proc = self._active_process
-            self._active_process = None
-        self.is_closed = True
+    def _build_acp_command(self, model_hint: str | None) -> list[str]:
+        cmd = [self._acp_command, *self._acp_args]
+        effective_hint = (model_hint or "").strip()
+        if effective_hint.lower() in CURSOR_ACP_PLACEHOLDER_MODELS:
+            effective_hint = ""
+        if effective_hint and "--model" not in cmd:
+            cmd.extend(["--model", effective_hint])
+        return cmd
+
+    def _teardown_persistent_locked(self) -> None:
+        proc = self._active_process
+        self._active_process = None
+        self._session_id = None
+        self._session_cmd_key = None
+        self._session_cwd = None
+        self._reader_threads = []
+        while True:
+            try:
+                self._inbox.get_nowait()
+            except queue.Empty:
+                break
         if proc is None:
             return
         try:
@@ -423,6 +445,185 @@ class CursorACPClient:
                 proc.kill()
             except Exception:
                 pass
+
+    def close(self) -> None:
+        with self._active_process_lock:
+            self._teardown_persistent_locked()
+        self.is_closed = True
+
+    def _start_reader_threads(self, proc: subprocess.Popen[str]) -> None:
+        def _stdout_reader() -> None:
+            if proc.stdout is None:
+                return
+            for line in proc.stdout:
+                try:
+                    self._inbox.put(json.loads(line))
+                except Exception:
+                    self._inbox.put({"raw": line.rstrip("\n")})
+
+        def _stderr_reader() -> None:
+            if proc.stderr is None:
+                return
+            for line in proc.stderr:
+                self._stderr_tail.append(line.rstrip("\n"))
+
+        out_thread = threading.Thread(target=_stdout_reader, daemon=True)
+        err_thread = threading.Thread(target=_stderr_reader, daemon=True)
+        out_thread.start()
+        err_thread.start()
+        self._reader_threads = [out_thread, err_thread]
+
+    def _spawn_persistent_process(self, cmd: list[str]) -> subprocess.Popen[str]:
+        from hermes_cli._subprocess_compat import windows_hide_flags
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                cwd=self._acp_cwd,
+                env=_build_subprocess_env(),
+                creationflags=windows_hide_flags(),
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"Could not start Cursor ACP command '{cmd[0]}'. "
+                "Install Cursor CLI (curl https://cursor.com/install -fsS | bash) "
+                "and authenticate (cursor agent login), or set HERMES_CURSOR_ACP_COMMAND/CURSOR_CLI_PATH."
+            ) from exc
+        if proc.stdin is None or proc.stdout is None:
+            proc.kill()
+            raise RuntimeError("Cursor ACP process did not expose stdin/stdout pipes.")
+        return proc
+
+    def _jsonrpc_request(
+        self,
+        proc: subprocess.Popen[str],
+        method: str,
+        params: dict[str, Any],
+        *,
+        timeout_seconds: float,
+        text_parts: list[str] | None = None,
+        reasoning_parts: list[str] | None = None,
+    ) -> Any:
+        self._rpc_id += 1
+        request_id = self._rpc_id
+        payload = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        }
+        if proc.stdin is None:
+            raise RuntimeError("Cursor ACP process stdin is closed.")
+        proc.stdin.write(json.dumps(payload) + "\n")
+        proc.stdin.flush()
+
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                break
+            try:
+                msg = self._inbox.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if self._handle_server_message(
+                msg,
+                process=proc,
+                cwd=self._acp_cwd,
+                text_parts=text_parts,
+                reasoning_parts=reasoning_parts,
+            ):
+                continue
+
+            if msg.get("id") != request_id:
+                continue
+            if "error" in msg:
+                err = msg.get("error") or {}
+                raise RuntimeError(
+                    f"Cursor ACP {method} failed: {err.get('message') or err}"
+                )
+            return msg.get("result")
+
+        stderr_text = "\n".join(self._stderr_tail).strip()
+        if proc.poll() is not None and stderr_text:
+            lower = stderr_text.lower()
+            if "not authenticated" in lower or "login" in lower:
+                raise RuntimeError(
+                    "Cursor CLI is not authenticated.\n\n"
+                    "Run: cursor agent login\n\n"
+                    f"Original error:\n{stderr_text}"
+                )
+            raise RuntimeError(f"Cursor ACP process exited early: {stderr_text}")
+        raise TimeoutError(f"Timed out waiting for Cursor ACP response to {method}.")
+
+    def _ensure_persistent_session(
+        self, *, model_hint: str | None, timeout_seconds: float
+    ) -> tuple[subprocess.Popen[str], str]:
+        cmd = self._build_acp_command(model_hint)
+        cmd_key = tuple(cmd)
+        cwd = self._acp_cwd
+        proc = self._active_process
+        if (
+            proc is not None
+            and proc.poll() is None
+            and self._session_id
+            and self._session_cmd_key == cmd_key
+            and self._session_cwd == cwd
+        ):
+            return proc, self._session_id
+
+        self._teardown_persistent_locked()
+        proc = self._spawn_persistent_process(cmd)
+        self._active_process = proc
+        self._session_cmd_key = cmd_key
+        self._session_cwd = cwd
+        self.is_closed = False
+        self._start_reader_threads(proc)
+
+        self._jsonrpc_request(
+            proc,
+            "initialize",
+            {
+                "protocolVersion": 1,
+                "clientCapabilities": {
+                    "fs": {
+                        "readTextFile": True,
+                        "writeTextFile": True,
+                    }
+                },
+                "clientInfo": {
+                    "name": "hermes-agent",
+                    "title": "Hermes Agent",
+                    "version": "0.0.0",
+                },
+            },
+            timeout_seconds=timeout_seconds,
+        )
+        session = (
+            self._jsonrpc_request(
+                proc,
+                "session/new",
+                {
+                    "cwd": cwd,
+                    "mcpServers": [],
+                },
+                timeout_seconds=timeout_seconds,
+            )
+            or {}
+        )
+        session_id = str(session.get("sessionId") or "").strip()
+        if not session_id:
+            self._teardown_persistent_locked()
+            raise RuntimeError("Cursor ACP did not return a sessionId.")
+        self._session_id = session_id
+        return proc, session_id
 
     def _create_chat_completion(
         self,
@@ -489,177 +690,43 @@ class CursorACPClient:
     def _run_prompt(
         self, prompt_text: str, *, model_hint: str | None, timeout_seconds: float
     ) -> tuple[str, str]:
-        try:
-            from hermes_cli._subprocess_compat import windows_hide_flags
-
-            cmd = [self._acp_command] + self._acp_args
-            # If a model hint was requested, pass it via --model flag.
-            effective_hint = (model_hint or "").strip()
-            if effective_hint.lower() in CURSOR_ACP_PLACEHOLDER_MODELS:
-                effective_hint = ""
-            if effective_hint and "--model" not in cmd:
-                cmd.extend(["--model", effective_hint])
-
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                cwd=self._acp_cwd,
-                env=_build_subprocess_env(),
-                creationflags=windows_hide_flags(),
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"Could not start Cursor ACP command '{self._acp_command}'. "
-                "Install Cursor CLI (curl https://cursor.com/install -fsS | bash) "
-                "and authenticate (cursor agent login), or set HERMES_CURSOR_ACP_COMMAND/CURSOR_CLI_PATH."
-            ) from exc
-
-        if proc.stdin is None or proc.stdout is None:
-            proc.kill()
-            raise RuntimeError("Cursor ACP process did not expose stdin/stdout pipes.")
-
-        self.is_closed = False
-        with self._active_process_lock:
-            self._active_process = proc
-
-        inbox: queue.Queue[dict[str, Any]] = queue.Queue()
-        stderr_tail: deque[str] = deque(maxlen=40)
-
-        def _stdout_reader() -> None:
-            if proc.stdout is None:
-                return
-            for line in proc.stdout:
-                try:
-                    inbox.put(json.loads(line))
-                except Exception:
-                    inbox.put({"raw": line.rstrip("\n")})
-
-        def _stderr_reader() -> None:
-            if proc.stderr is None:
-                return
-            for line in proc.stderr:
-                stderr_tail.append(line.rstrip("\n"))
-
-        out_thread = threading.Thread(target=_stdout_reader, daemon=True)
-        err_thread = threading.Thread(target=_stderr_reader, daemon=True)
-        out_thread.start()
-        err_thread.start()
-
-        next_id = 0
-
-        def _request(
-            method: str,
-            params: dict[str, Any],
-            *,
-            text_parts: list[str] | None = None,
-            reasoning_parts: list[str] | None = None,
-        ) -> Any:
-            nonlocal next_id
-            next_id += 1
-            request_id = next_id
-            payload = {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": method,
-                "params": params,
-            }
-            proc.stdin.write(json.dumps(payload) + "\n")
-            proc.stdin.flush()
-
-            deadline = time.monotonic() + timeout_seconds
-            while time.monotonic() < deadline:
-                if proc.poll() is not None:
-                    break
-                try:
-                    msg = inbox.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-
-                if self._handle_server_message(
-                    msg,
-                    process=proc,
-                    cwd=self._acp_cwd,
-                    text_parts=text_parts,
-                    reasoning_parts=reasoning_parts,
-                ):
-                    continue
-
-                if msg.get("id") != request_id:
-                    continue
-                if "error" in msg:
-                    err = msg.get("error") or {}
-                    raise RuntimeError(
-                        f"Cursor ACP {method} failed: {err.get('message') or err}"
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                with self._active_process_lock:
+                    proc, session_id = self._ensure_persistent_session(
+                        model_hint=model_hint,
+                        timeout_seconds=timeout_seconds,
                     )
-                return msg.get("result")
-
-            stderr_text = "\n".join(stderr_tail).strip()
-            if proc.poll() is not None and stderr_text:
-                # Check for common auth issues.
-                lower = stderr_text.lower()
-                if "not authenticated" in lower or "login" in lower:
-                    raise RuntimeError(
-                        "Cursor CLI is not authenticated.\n\n"
-                        "Run: cursor agent login\n\n"
-                        f"Original error:\n{stderr_text}"
-                    )
-                raise RuntimeError(f"Cursor ACP process exited early: {stderr_text}")
-            raise TimeoutError(f"Timed out waiting for Cursor ACP response to {method}.")
-
-        try:
-            _request(
-                "initialize",
-                {
-                    "protocolVersion": 1,
-                    "clientCapabilities": {
-                        "fs": {
-                            "readTextFile": True,
-                            "writeTextFile": True,
-                        }
-                    },
-                    "clientInfo": {
-                        "name": "hermes-agent",
-                        "title": "Hermes Agent",
-                        "version": "0.0.0",
-                    },
-                },
-            )
-            session = _request(
-                "session/new",
-                {
-                    "cwd": self._acp_cwd,
-                    "mcpServers": [],
-                },
-            ) or {}
-            session_id = str(session.get("sessionId") or "").strip()
-            if not session_id:
-                raise RuntimeError("Cursor ACP did not return a sessionId.")
-
-            text_parts: list[str] = []
-            reasoning_parts: list[str] = []
-            _request(
-                "session/prompt",
-                {
-                    "sessionId": session_id,
-                    "prompt": [
+                    text_parts: list[str] = []
+                    reasoning_parts: list[str] = []
+                    self._jsonrpc_request(
+                        proc,
+                        "session/prompt",
                         {
-                            "type": "text",
-                            "text": prompt_text,
-                        }
-                    ],
-                },
-                text_parts=text_parts,
-                reasoning_parts=reasoning_parts,
-            )
-            return "".join(text_parts), "".join(reasoning_parts)
-        finally:
-            self.close()
+                            "sessionId": session_id,
+                            "prompt": [
+                                {
+                                    "type": "text",
+                                    "text": prompt_text,
+                                }
+                            ],
+                        },
+                        timeout_seconds=timeout_seconds,
+                        text_parts=text_parts,
+                        reasoning_parts=reasoning_parts,
+                    )
+                return "".join(text_parts), "".join(reasoning_parts)
+            except Exception as exc:
+                last_error = exc
+                with self._active_process_lock:
+                    self._teardown_persistent_locked()
+                if attempt == 0:
+                    continue
+                raise
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Cursor ACP prompt failed without a response.")
 
     def _handle_server_message(
         self,
